@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+python-multipart
+
+google-cloud-storage
+google-cloud-bigquery
+
+httpx

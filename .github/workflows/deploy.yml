@@ -1,0 +1,11 @@
+name: Build and Deploy Services (Stub)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  echo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Add Docker build and gcloud run deploy steps here."
