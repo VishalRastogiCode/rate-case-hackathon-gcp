@@ -1,13 +1,16 @@
 import os
 import uuid
-
+import io
 from typing import List
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 
 from google.cloud import storage, bigquery
-import httpx  # <-- add this
+
+from pypdf import PdfReader       # <-- NEW
+from docx import Document         # <-- NEW
+import httpx                      # <-- if you auto-call embedder
 
 # Try to resolve project ID, but DO NOT crash if missing.
 PROJECT_ID = (
@@ -16,12 +19,12 @@ PROJECT_ID = (
     or "rate-case-app-hackathon"  # safe default for Cloud Run in your project
 )
 
+#PROJECT_ID = os.environ.get("GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
 BQ_DATASET = os.environ.get("BQ_DATASET", "rc")
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "")  # empty string if not set
 EMBEDDER_URL = os.environ.get("EMBEDDER_URL")  # <-- add this
 
 app = FastAPI(title="Ingest & Chunker (GCS + BigQuery)")
-
 
 def get_storage_client() -> storage.Client:
     return storage.Client(project=PROJECT_ID)
@@ -93,46 +96,70 @@ async def ingest_pdf(file: UploadFile = File(...)):
     """
     Minimal viable ingest for hackathon:
     - Uploads the raw file to GCS
-    - Decodes text (best-effort) from bytes
+    - Extracts text from PDF or DOCX (best-effort)
     - Stores one chunk per file into BigQuery.rc.document_chunks
+    - Optionally calls the embedder service to create embeddings
     """
-
-    if not GCS_BUCKET:
-        raise HTTPException(
-            status_code=500,
-            detail="GCS_BUCKET env var must be set for ingest-chunker",
-        )
 
     content = await file.read()
     if not content:
         return []
 
-    # Store raw file in GCS for traceability
+    # 1) Store raw file in GCS for traceability
     filename = f"uploads/{uuid.uuid4()}_{file.filename}"
     gcs_uri = upload_to_gcs(content, filename)
 
-    # For hackathon, do simple text decoding instead of full DocAI OCR
-    try:
-        text = content.decode("utf-8", errors="ignore")
-    except Exception:
-        text = "Unable to decode file contents as text."
+    # 2) Extract text based on file type
+    fname = (file.filename or "").lower()
+    text = ""
 
+    try:
+        if fname.endswith(".pdf"):
+            # PDF -> use pypdf
+            reader = PdfReader(io.BytesIO(content))
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                text += page_text + "\n"
+
+        elif fname.endswith(".docx"):
+            # DOCX -> use python-docx
+            doc = Document(io.BytesIO(content))
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            text = "\n".join(paragraphs)
+
+        else:
+            # Fallback: try plain text
+            text = content.decode("utf-8", errors="ignore")
+
+    except Exception as e:
+        # This is where you were seeing NameError before
+        text = f"Unable to extract text from file ({type(e).__name__})."
+
+    # Truncate to keep it reasonable
+    text = text[:8000]
+
+    # 3) Build a single chunk
     doc_id = str(uuid.uuid4())
     chunk = Chunk(
         chunk_id=str(uuid.uuid4()),
         doc_id=doc_id,
         page_start=1,
         page_end=1,
-        text=f"[GCS:{gcs_uri}]\n\n{text[:8000]}",
+        text=f"[GCS:{gcs_uri}]\n\n{text}",
     )
 
+    # 4) Write to BigQuery
     write_chunks_to_bq([chunk])
 
-    # Trigger embedding asynchronously (best-effort)
-    await trigger_embedding(limit=50)
-    
-    return [chunk]
+    # 5) Optional: auto-call embedder so embeddings are created right away
+    if EMBEDDER_URL:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(EMBEDDER_URL, json={"limit": 50})
+        except Exception as e:
+            print(f"Warning: failed to call embedder: {e}")
 
+    return [chunk]
 
 @app.get("/")
 def root():
