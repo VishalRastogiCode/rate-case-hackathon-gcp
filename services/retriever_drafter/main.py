@@ -1,7 +1,6 @@
 import os
 import math
 import logging
-
 from typing import List
 
 from fastapi import FastAPI, HTTPException
@@ -27,8 +26,14 @@ VERTEX_LOCATION = "us-central1"
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-004")
 GEN_MODEL = os.environ.get("GEN_MODEL", "gemini-2.5-flash-lite")
 
-app = FastAPI(title="Retriever & Drafter (Vertex + BigQuery)")
+app = FastAPI(title="Retriever & Drafter (Vertex + BigQuery + Agents)")
 
+# --- Logging setup ---
+logger = logging.getLogger("retriever")
+logging.basicConfig(level=logging.INFO)
+
+
+# ---------- Helpers ----------
 
 def get_bq_client() -> bigquery.Client:
     return bigquery.Client(project=PROJECT_ID)
@@ -44,13 +49,38 @@ def get_gen_model() -> GenerativeModel:
     return GenerativeModel(GEN_MODEL)
 
 
+def call_gemini(prompt: str, stage: str) -> str:
+    """
+    Wrapper to call Gemini, with logging per agent stage.
+    """
+    logger.info(
+        f"[ASK] Calling Gemini stage={stage}, model={GEN_MODEL}, location={VERTEX_LOCATION}"
+    )
+    model = get_gen_model()
+    resp = model.generate_content(prompt)
+    text = getattr(resp, "text", None) or str(resp)
+    logger.info(
+        f"[ASK] Gemini stage={stage} succeeded, len={len(text)} characters."
+    )
+    return text
+
+
 class Question(BaseModel):
     question: str
     k: int = 5  # number of chunks to retrieve
 
 
 class Answer(BaseModel):
+    # Final answer (this is what UI shows)
     answer: str
+
+    # Agent traces (optional but great for demo/debug)
+    draft_answer: str = ""
+    validator_notes: str = ""
+    business_review: str = ""
+    legal_review: str = ""
+
+    # Retrieval trace
     supporting_chunks: List[str]
 
 
@@ -63,111 +93,24 @@ def cosine(a: List[float], b: List[float]) -> float:
     return dot / (na * nb + 1e-8)
 
 
-@app.post("/ask", response_model=Answer)
-async def ask(q: Question):
-    """
-    - Embeds the incoming question with Vertex AI.
-    - Loads embedded chunks from BigQuery.
-    - Ranks by cosine similarity.
-    - Calls Gemini (GEN_MODEL, e.g. gemini-2.5-flash-lite) to draft a natural language answer
-      using the top-k chunks as context.
-    """
-    if not q.question or not q.question.strip():
-        raise HTTPException(status_code=400, detail="question must be non-empty")
-
-    # 1) Embed the question
-    emb_model = get_embedding_model()
-    q_emb = emb_model.get_embeddings([q.question])[0].values
-
-    # 2) Fetch embedded chunks from BigQuery
-    bq_client = get_bq_client()
-    query = f"""
-    SELECT e.chunk_id, e.emb, c.text
-    FROM `{PROJECT_ID}.{BQ_DATASET}.embeddings` e
-    JOIN `{PROJECT_ID}.{BQ_DATASET}.document_chunks` c
-      ON e.chunk_id = c.chunk_id
-    LIMIT 200
-    """
-    rows = list(bq_client.query(query))
-
-    if not rows:
-        return Answer(
-            answer=(
-                "No embedded context is available in BigQuery. "
-                f"Make sure ingest + embedder have populated "
-                f"`{PROJECT_ID}.{BQ_DATASET}.embeddings`."
-            ),
-            supporting_chunks=[],
-        )
-
-    # 3) Score by cosine similarity
-    scored = []
-    for r in rows:
-        emb = r["emb"]  # ARRAY<FLOAT64>
-        score = cosine(q_emb, emb)
-        scored.append((score, r))
-
-    scored.sort(reverse=True, key=lambda x: x[0])
-    top = scored[: max(1, q.k)]
-
-    top_texts = [r["text"] for _, r in top]
-    top_ids = [r["chunk_id"] for _, r in top]
-
-    # 4) Build context string for Gemini
-    context = "\n\n".join(f"- {t}" for t in top_texts)
-
-    # 5) Call Gemini to synthesize the final answer
-    gen_model = get_gen_model()
-    prompt = (
-        "You are a regulatory rate case assistant. Use ONLY the context below to answer.\n\n"
-        "If the context does not contain the answer, say so explicitly and do not hallucinate.\n\n"
-        f"CONTEXT:\n{context}\n\n"
-        f"QUESTION:\n{q.question}\n\n"
-        "Provide a clear, concise answer in English, with a short explanation that references "
-        "key drivers (e.g., major cost categories, test year vs. historical trend, and any "
-        "one-time or ongoing adjustments)."
-    )
-
-    try:
-        resp = gen_model.generate_content(prompt)
-        # For the Vertex AI Python SDK, resp.text is the usual convenience property:
-        answer_text = getattr(resp, "text", None) or str(resp)
-    except Exception as e:
-        # If Gemini fails for any reason, fall back to returning context only
-        answer_text = (
-            "Gemini call failed, but here are the top relevant context chunks:\n\n"
-            f"{context[:4000]}\n\n"
-            f"(Error from Gemini: {e})"
-        )
-
-    return Answer(
-        answer=answer_text,
-        supporting_chunks=top_ids,
-    )
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "project": PROJECT_ID,
-        "dataset": BQ_DATASET,
-        "vertex_location": VERTEX_LOCATION,
-        "embed_model": EMBED_MODEL,
-        "gen_model": GEN_MODEL,
-    }
-
-logger = logging.getLogger("retriever")
-logging.basicConfig(level=logging.INFO)
+# ---------- Main RAG + Agents pipeline ----------
 
 @app.post("/ask", response_model=Answer)
 async def ask(q: Question):
     """
-    - Embeds the incoming question with Vertex AI.
-    - Loads embedded chunks from BigQuery.
-    - Ranks by cosine similarity.
-    - Calls Gemini (GEN_MODEL) to draft a natural language answer.
+    Pipeline:
+    1) Embed the question (Vertex embeddings in us-central1)
+    2) Retrieve top-k chunks from BigQuery (embeddings + document_chunks)
+    3) Drafting Agent (Gemini) -> initial answer
+    4) Validator Agent -> checks grounding, hallucinations, tone
+    5) Business Reviewer Agent -> accounting / regulatory narrative
+    6) Legal Reviewer Agent -> legal / regulatory risk posture
+    7) Orchestrator -> final synthesized answer
+
+    Final `answer` is prefixed with a banner:
+    [Generated by {GEN_MODEL} @ {VERTEX_LOCATION}]
     """
+
     if not q.question or not q.question.strip():
         raise HTTPException(status_code=400, detail="question must be non-empty")
 
@@ -187,7 +130,9 @@ async def ask(q: Question):
       ON e.chunk_id = c.chunk_id
     LIMIT 200
     """
-    logger.info(f"[ASK] Querying BigQuery: {PROJECT_ID}.{BQ_DATASET}.embeddings + document_chunks")
+    logger.info(
+        f"[ASK] Querying BigQuery: {PROJECT_ID}.{BQ_DATASET}.embeddings + document_chunks"
+    )
     rows = list(bq_client.query(query))
 
     if not rows:
@@ -198,6 +143,10 @@ async def ask(q: Question):
                 f"Make sure ingest + embedder have populated "
                 f"`{PROJECT_ID}.{BQ_DATASET}.embeddings`."
             ),
+            draft_answer="",
+            validator_notes="",
+            business_review="",
+            legal_review="",
             supporting_chunks=[],
         )
 
@@ -216,38 +165,191 @@ async def ask(q: Question):
 
     logger.info(f"[ASK] Using top {len(top_ids)} chunks as context for Gemini. Chunk IDs: {top_ids}")
 
-    # 4) Build context string for Gemini
     context = "\n\n".join(f"- {t}" for t in top_texts)
 
-    # 5) Call Gemini to synthesize the final answer
-    gen_model = get_gen_model()
-    logger.info(f"[ASK] Calling Gemini model: {GEN_MODEL} in {VERTEX_LOCATION}")
+    # ---------- Agent 1: Drafting Agent ----------
 
-    prompt = (
-        "You are a regulatory rate case assistant. Use ONLY the context below to answer.\n\n"
-        "If the context does not contain the answer, say so explicitly and do not hallucinate.\n\n"
-        f"CONTEXT:\n{context}\n\n"
-        f"QUESTION:\n{q.question}\n\n"
-        "Provide a clear, concise answer in English, with a short explanation that references "
-        "key drivers (e.g., major cost categories, test year vs. historical trend, and any "
-        "one-time or ongoing adjustments)."
-    )
+    draft_prompt = f"""
+You are the Drafting Agent for a utility rate case assistant.
 
-    try:
-        resp = gen_model.generate_content(prompt)
-        answer_text = getattr(resp, "text", None) or str(resp)
-        answer_text = f"[Generated by {GEN_MODEL} @ {VERTEX_LOCATION}]\n\n" + answer_text
-        logger.info("[ASK] Gemini call succeeded.")
-    except Exception as e:
-        logger.exception("[ASK] Gemini call failed; falling back to raw context.")
-        answer_text = (
-            "Gemini call failed, but here are the top relevant context chunks:\n\n"
-            f"{context[:4000]}\n\n"
-            f"(Error from Gemini: {e})"
-        )
+Task:
+- Use ONLY the context below.
+- Answer the question clearly, in professional English.
+- Be specific with numbers, trends, and drivers when they appear in the context.
+- If context is insufficient, explicitly say that and DO NOT invent numbers.
+
+CONTEXT:
+{context}
+
+QUESTION:
+{q.question}
+
+Write a concise, well-structured answer (2–4 paragraphs).
+"""
+    draft_answer = call_gemini(draft_prompt, stage="draft")
+
+    # ---------- Agent 2: Response Validator Agent ----------
+
+    validator_prompt = f"""
+You are the Response Validator Agent for a regulated utility rate case.
+
+You are given:
+1) The original QUESTION.
+2) The CONTEXT (source text chunks from filings, workpapers, etc.).
+3) A DRAFT ANSWER produced by another agent.
+
+Your tasks:
+- Check that the draft answer is grounded in the CONTEXT.
+- Flag any possible hallucinations or numbers not supported by context.
+- Flag if tone or phrasing might be misleading to regulators.
+- Suggest precise corrections if something is wrong.
+- If overall answer is good, say so explicitly.
+
+Respond with:
+1) A short verdict line: "VERDICT: [OK]" or "VERDICT: [REVISION NEEDED]"
+2) Bullet points of issues or confirmations.
+3) If necessary, provide a corrected version starting with "CORRECTED ANSWER:".
+
+QUESTION:
+{q.question}
+
+CONTEXT:
+{context}
+
+DRAFT ANSWER:
+{draft_answer}
+"""
+    validator_notes = call_gemini(validator_prompt, stage="validator")
+
+    # ---------- Agent 3: Business Reviewer Agent ----------
+
+    business_prompt = f"""
+You are the Business Reviewer Agent (Accounting & Regulatory Narrative).
+
+Given:
+- QUESTION
+- DRAFT ANSWER
+- VALIDATOR NOTES
+
+Task:
+- Assess whether the answer aligns with typical utility accounting,
+  cost drivers, and regulatory rate case narratives.
+- Focus on business realism (e.g., O&M drivers, inflation, workforce, reliability,
+  environmental compliance, etc.).
+- Suggest improvements to framing, if any, to better support the utility's position.
+
+Respond with 1–2 short paragraphs in plain English.
+Do NOT restate the full context – only your review.
+
+QUESTION:
+{q.question}
+
+DRAFT ANSWER:
+{draft_answer}
+
+VALIDATOR NOTES:
+{validator_notes}
+"""
+    business_review = call_gemini(business_prompt, stage="business_review")
+
+    # ---------- Agent 4: Legal Reviewer Agent ----------
+
+    legal_prompt = f"""
+You are the Legal/Regulatory Reviewer Agent for a utility rate case.
+
+Given:
+- QUESTION
+- DRAFT ANSWER
+- VALIDATOR NOTES
+- BUSINESS REVIEW (summary)
+
+Task:
+- Identify any potential legal/regulatory risks in the answer.
+- Ensure the answer stays consistent with a cautious, defensible regulatory posture.
+- Suggest wording that avoids over-committing, misrepresenting precedent,
+  or contradicting typical commission expectations.
+- Highlight if any claims should be softened or explicitly caveated.
+
+Respond with:
+- A short risk summary (2–4 bullet points).
+- Optional suggested language improvements.
+
+QUESTION:
+{q.question}
+
+DRAFT ANSWER:
+{draft_answer}
+
+VALIDATOR NOTES:
+{validator_notes}
+
+BUSINESS REVIEW:
+{business_review}
+"""
+    legal_review = call_gemini(legal_prompt, stage="legal_review")
+
+    # ---------- Orchestrator: Final answer ----------
+
+    final_prompt = f"""
+You are the Orchestrator Agent.
+
+You are given:
+- QUESTION
+- DRAFT ANSWER
+- VALIDATOR NOTES
+- BUSINESS REVIEW
+- LEGAL REVIEW
+
+Task:
+- Produce a FINAL ANSWER for the intervenor.
+- It must:
+  * Be grounded in the context (no new invented numbers).
+  * Respect the validator's concerns.
+  * Incorporate business framing where helpful.
+  * Respect legal/regulatory caution.
+- Keep it concise: 2–4 paragraphs, professional tone.
+- Do NOT mention the words "agent", "validator", "business reviewer", or "legal reviewer".
+- Just present the final answer as if written once, cleanly.
+
+QUESTION:
+{q.question}
+
+DRAFT ANSWER:
+{draft_answer}
+
+VALIDATOR NOTES:
+{validator_notes}
+
+BUSINESS REVIEW:
+{business_review}
+
+LEGAL REVIEW:
+{legal_review}
+"""
+    final_answer_core = call_gemini(final_prompt, stage="orchestrator")
+
+    # Add explicit banner so we KNOW this is LLM-generated:
+    final_answer = f"[Generated by {GEN_MODEL} @ {VERTEX_LOCATION}]\n\n{final_answer_core}"
+    logger.info("[ASK] Final orchestrated answer generated.")
 
     return Answer(
-        #answer=answer_text,
-        answer_text = f"[Generated by {GEN_MODEL} @ {VERTEX_LOCATION}]\n\n{resp.text}",
+        answer=final_answer,
+        draft_answer=draft_answer,
+        validator_notes=validator_notes,
+        business_review=business_review,
+        legal_review=legal_review,
         supporting_chunks=top_ids,
     )
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "project": PROJECT_ID,
+        "dataset": BQ_DATASET,
+        "vertex_location": VERTEX_LOCATION,
+        "embed_model": EMBED_MODEL,
+        "gen_model": GEN_MODEL,
+    }
+    
